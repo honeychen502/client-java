@@ -15,13 +15,8 @@
 
 package org.tikv.common;
 
-import static org.tikv.common.util.KeyRangeUtils.makeRange;
-
 import com.google.common.collect.Range;
 import com.google.protobuf.ByteString;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
 import org.tikv.common.exception.TiClientInternalException;
 import org.tikv.common.key.Key;
 import org.tikv.common.meta.TiTimestamp;
@@ -30,23 +25,27 @@ import org.tikv.common.region.RegionStoreClient;
 import org.tikv.common.region.TiRegion;
 import org.tikv.common.util.BackOffer;
 import org.tikv.common.util.ConcreteBackOffer;
-import org.tikv.common.util.Pair;
 import org.tikv.kvproto.Kvrpcpb.KvPair;
-import org.tikv.kvproto.Metapb.Store;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+import static org.tikv.common.util.KeyRangeUtils.makeRange;
 
 public class Snapshot {
   private final TiTimestamp timestamp;
-  private final TiSession session;
+  //private final TiSession session;
   private final TiConfiguration conf;
+  private final RegionStoreClient.RegionStoreClientBuilder clientBuilder;
+  private ReadOnlyPDClient pdClient;
 
-  public Snapshot(TiTimestamp timestamp, TiSession session) {
+  public Snapshot(TiConfiguration conf, ReadOnlyPDClient pdClient,
+                  RegionStoreClient.RegionStoreClientBuilder builder, TiTimestamp timestamp) {
     this.timestamp = timestamp;
-    this.session = session;
-    this.conf = session.getConf();
-  }
-
-  public TiSession getSession() {
-    return session;
+    this.conf = conf;
+    this.pdClient = pdClient;
+    this.clientBuilder = builder;
   }
 
   public long getVersion() {
@@ -64,14 +63,15 @@ public class Snapshot {
   }
 
   public ByteString get(ByteString key) {
-    Pair<TiRegion, Store> pair = session.getRegionManager().getRegionStorePairByKey(key);
-    RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, getSession());
+    RegionStoreClient client = clientBuilder.build(key);
     // TODO: Need to deal with lock error after grpc stable
     return client.get(ConcreteBackOffer.newGetBackOff(), key, timestamp.getVersion());
   }
 
   public Iterator<KvPair> scan(ByteString startKey) {
-    return new ConcreteScanIterator(startKey, session, timestamp.getVersion());
+    BackOffer bo = ConcreteBackOffer.newTsoBackOff();
+    long version = pdClient.getTimestamp(bo).getVersion();
+    return new ConcreteScanIterator(conf, clientBuilder, startKey, version);
   }
 
   // TODO: Need faster implementation, say concurrent version
@@ -79,19 +79,16 @@ public class Snapshot {
   public List<KvPair> batchGet(List<ByteString> keys) {
     TiRegion curRegion = null;
     Range<Key> curKeyRange = null;
-    Pair<TiRegion, Store> lastPair;
     List<ByteString> keyBuffer = new ArrayList<>();
     List<KvPair> result = new ArrayList<>(keys.size());
     BackOffer backOffer = ConcreteBackOffer.newBatchGetMaxBackOff();
     for (ByteString key : keys) {
       if (curRegion == null || !curKeyRange.contains(Key.toRawKey(key))) {
-        Pair<TiRegion, Store> pair = session.getRegionManager().getRegionStorePairByKey(key);
-        lastPair = pair;
-        curRegion = pair.first;
+        TiRegion region = pdClient.getRegionByKey(backOffer, key);
+        curRegion = region;
         curKeyRange = makeRange(curRegion.getStartKey(), curRegion.getEndKey());
 
-        try (RegionStoreClient client =
-            RegionStoreClient.create(lastPair.first, lastPair.second, getSession())) {
+        try (RegionStoreClient client = clientBuilder.build(key)) {
           List<KvPair> partialResult =
               client.batchGet(backOffer, keyBuffer, timestamp.getVersion());
           // TODO: Add lock check

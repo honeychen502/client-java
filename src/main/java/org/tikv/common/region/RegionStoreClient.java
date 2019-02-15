@@ -28,16 +28,36 @@ import io.grpc.ManagedChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Supplier;
 import org.apache.log4j.Logger;
 import org.tikv.common.AbstractGRPCClient;
-import org.tikv.common.TiSession;
+import org.tikv.common.TiConfiguration;
 import org.tikv.common.exception.KeyException;
 import org.tikv.common.exception.RegionException;
 import org.tikv.common.exception.TiClientInternalException;
 import org.tikv.common.operation.KVErrorHandler;
 import org.tikv.common.util.BackOffer;
-import org.tikv.kvproto.Kvrpcpb.*;
+import org.tikv.common.util.ChannelFactory;
+import org.tikv.common.util.Pair;
+import org.tikv.kvproto.Kvrpcpb;
+import org.tikv.kvproto.Kvrpcpb.BatchGetRequest;
+import org.tikv.kvproto.Kvrpcpb.BatchGetResponse;
+import org.tikv.kvproto.Kvrpcpb.GetRequest;
+import org.tikv.kvproto.Kvrpcpb.GetResponse;
+import org.tikv.kvproto.Kvrpcpb.KvPair;
+import org.tikv.kvproto.Kvrpcpb.RawBatchPutRequest;
+import org.tikv.kvproto.Kvrpcpb.RawBatchPutResponse;
+import org.tikv.kvproto.Kvrpcpb.RawDeleteRequest;
+import org.tikv.kvproto.Kvrpcpb.RawDeleteResponse;
+import org.tikv.kvproto.Kvrpcpb.RawGetRequest;
+import org.tikv.kvproto.Kvrpcpb.RawGetResponse;
+import org.tikv.kvproto.Kvrpcpb.RawPutRequest;
+import org.tikv.kvproto.Kvrpcpb.RawPutResponse;
+import org.tikv.kvproto.Kvrpcpb.RawScanRequest;
+import org.tikv.kvproto.Kvrpcpb.RawScanResponse;
+import org.tikv.kvproto.Kvrpcpb.ScanRequest;
+import org.tikv.kvproto.Kvrpcpb.ScanResponse;
 import org.tikv.kvproto.Metapb.Store;
 import org.tikv.kvproto.TikvGrpc;
 import org.tikv.kvproto.TikvGrpc.TikvBlockingStub;
@@ -47,44 +67,44 @@ import org.tikv.txn.LockResolverClient;
 
 // RegionStore itself is not thread-safe
 public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, TikvStub>
-    implements RegionErrorReceiver {
+        implements RegionErrorReceiver {
 
   private static final Logger logger = Logger.getLogger(RegionStoreClient.class);
   private TiRegion region;
   private final RegionManager regionManager;
-  //TODO change public to private
-  @VisibleForTesting
-  public final LockResolverClient lockResolverClient;
+  @VisibleForTesting public final LockResolverClient lockResolverClient;
   private TikvBlockingStub blockingStub;
   private TikvStub asyncStub;
 
-  // APIs for KV Scan/Put/Get/Delete
+  public TiRegion getRegion() {
+    return region;
+  }
 
+  // APIs for KV Scan/Put/Get/Delete
   public ByteString get(BackOffer backOffer, ByteString key, long version) {
     while (true) {
-      // we should refresh region
-      region = regionManager.getRegionByKey(key);
-
       Supplier<GetRequest> factory =
-          () ->
-              GetRequest.newBuilder()
-                  .setContext(region.getContext())
-                  .setKey(key)
-                  .setVersion(version)
-                  .build();
+              () ->
+                      GetRequest.newBuilder()
+                              .setContext(region.getContext())
+                              .setKey(key)
+                              .setVersion(version)
+                              .build();
 
       KVErrorHandler<GetResponse> handler =
-          new KVErrorHandler<>(
-              regionManager,
-              this,
-              region,
-              resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+              new KVErrorHandler<>(
+                      regionManager,
+                      this,
+                      region,
+                      resp -> resp.hasRegionError() ? resp.getRegionError() : null);
 
       GetResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_KV_GET, factory, handler);
 
       if (getHelper(backOffer, resp)) {
         return resp.getValue();
       }
+      // we should refresh region
+      region = regionManager.getRegionByKey(key);
     }
   }
 
@@ -103,11 +123,11 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
       if (resp.getError().hasLocked()) {
         Lock lock = new Lock(resp.getError().getLocked());
         boolean ok =
-            lockResolverClient.resolveLocks(backOffer, new ArrayList<>(Arrays.asList(lock)));
+                lockResolverClient.resolveLocks(backOffer, new ArrayList<>(Arrays.asList(lock)));
         if (!ok) {
           // if not resolve all locks, we wait and retry
           backOffer.doBackOff(
-              BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
+                  BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
         }
         return false;
       } else {
@@ -122,20 +142,20 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
   // TODO: batch get should consider key range split
   public List<KvPair> batchGet(BackOffer backOffer, Iterable<ByteString> keys, long version) {
     Supplier<BatchGetRequest> request =
-        () ->
-            BatchGetRequest.newBuilder()
-                .setContext(region.getContext())
-                .addAllKeys(keys)
-                .setVersion(version)
-                .build();
+            () ->
+                    BatchGetRequest.newBuilder()
+                            .setContext(region.getContext())
+                            .addAllKeys(keys)
+                            .setVersion(version)
+                            .build();
     KVErrorHandler<BatchGetResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     BatchGetResponse resp =
-        callWithRetry(backOffer, TikvGrpc.METHOD_KV_BATCH_GET, request, handler);
+            callWithRetry(backOffer, TikvGrpc.METHOD_KV_BATCH_GET, request, handler);
     return batchGetHelper(resp, backOffer);
   }
 
@@ -173,23 +193,23 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
   }
 
   public List<KvPair> scan(
-      BackOffer backOffer, ByteString startKey, long version, boolean keyOnly) {
+          BackOffer backOffer, ByteString startKey, long version, boolean keyOnly) {
     Supplier<ScanRequest> request =
-        () ->
-            ScanRequest.newBuilder()
-                .setContext(region.getContext())
-                .setStartKey(startKey)
-                .setVersion(version)
-                .setKeyOnly(keyOnly)
-                .setLimit(getConf().getScanBatchSize())
-                .build();
+            () ->
+                    ScanRequest.newBuilder()
+                            .setContext(region.getContext())
+                            .setStartKey(startKey)
+                            .setVersion(version)
+                            .setKeyOnly(keyOnly)
+                            .setLimit(getConf().getScanBatchSize())
+                            .build();
 
     KVErrorHandler<ScanResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     ScanResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_KV_SCAN, request, handler);
     return scanHelper(resp, backOffer);
   }
@@ -241,13 +261,13 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
 
   public ByteString rawGet(BackOffer backOffer, ByteString key) {
     Supplier<RawGetRequest> factory =
-        () -> RawGetRequest.newBuilder().setContext(region.getContext()).setKey(key).build();
+            () -> RawGetRequest.newBuilder().setContext(region.getContext()).setKey(key).build();
     KVErrorHandler<RawGetResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     RawGetResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_RAW_GET, factory, handler);
     return rawGetHelper(resp);
   }
@@ -269,14 +289,14 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
 
   public void rawDelete(BackOffer backOffer, ByteString key) {
     Supplier<RawDeleteRequest> factory =
-        () -> RawDeleteRequest.newBuilder().setContext(region.getContext()).setKey(key).build();
+            () -> RawDeleteRequest.newBuilder().setContext(region.getContext()).setKey(key).build();
 
     KVErrorHandler<RawDeleteResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     RawDeleteResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_RAW_DELETE, factory, handler);
     rawDeleteHelper(resp, region);
   }
@@ -297,19 +317,19 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
 
   public void rawPut(BackOffer backOffer, ByteString key, ByteString value) {
     Supplier<RawPutRequest> factory =
-        () ->
-            RawPutRequest.newBuilder()
-                .setContext(region.getContext())
-                .setKey(key)
-                .setValue(value)
-                .build();
+            () ->
+                    RawPutRequest.newBuilder()
+                            .setContext(region.getContext())
+                            .setKey(key)
+                            .setValue(value)
+                            .build();
 
     KVErrorHandler<RawPutResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     RawPutResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_RAW_PUT, factory, handler);
     rawPutHelper(resp);
   }
@@ -333,19 +353,19 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
       return;
     }
     Supplier<RawBatchPutRequest> factory =
-        () ->
-            RawBatchPutRequest.newBuilder()
-                .setContext(region.getContext())
-                .addAllPairs(kvPairs)
-                .build();
+            () ->
+                    RawBatchPutRequest.newBuilder()
+                            .setContext(region.getContext())
+                            .addAllPairs(kvPairs)
+                            .build();
     KVErrorHandler<RawBatchPutResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     RawBatchPutResponse resp =
-        callWithRetry(backOffer, TikvGrpc.METHOD_RAW_BATCH_PUT, factory, handler);
+            callWithRetry(backOffer, TikvGrpc.METHOD_RAW_BATCH_PUT, factory, handler);
     handleRawBatchPut(resp);
   }
 
@@ -370,20 +390,20 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
    */
   private List<KvPair> rawScan(BackOffer backOffer, ByteString key, int limit, boolean keyOnly) {
     Supplier<RawScanRequest> factory =
-        () ->
-            RawScanRequest.newBuilder()
-                .setContext(region.getContext())
-                .setStartKey(key)
-                .setKeyOnly(keyOnly)
-                .setLimit(limit)
-                .build();
+            () ->
+                    RawScanRequest.newBuilder()
+                            .setContext(region.getContext())
+                            .setStartKey(key)
+                            .setKeyOnly(keyOnly)
+                            .setLimit(limit)
+                            .build();
 
     KVErrorHandler<RawScanResponse> handler =
-        new KVErrorHandler<>(
-            regionManager,
-            this,
-            region,
-            resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+            new KVErrorHandler<>(
+                    regionManager,
+                    this,
+                    region,
+                    resp -> resp.hasRegionError() ? resp.getRegionError() : null);
     RawScanResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_RAW_SCAN, factory, handler);
     return rawScanHelper(resp);
   }
@@ -407,32 +427,425 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
     return resp.getKvsList();
   }
 
-  public static RegionStoreClient create(TiRegion region, Store store, TiSession session) {
-    RegionStoreClient client;
-    String addressStr = store.getAddress();
-    if (logger.isDebugEnabled()) {
-      logger.debug(String.format("Create region store client on address %s", addressStr));
+  // APIs for Transaction KV Scan/Put/Get/Delete
+  public void deleteRange(BackOffer backOffer, ByteString startKey, ByteString endKey) {
+    while(true) {
+      Supplier<Kvrpcpb.DeleteRangeRequest> factory =
+              () -> Kvrpcpb.DeleteRangeRequest.newBuilder().setContext(region.getContext()).setStartKey(startKey).setEndKey(endKey).build();
+      KVErrorHandler<Kvrpcpb.DeleteRangeResponse> handler = new KVErrorHandler<>(
+              regionManager,
+              this,
+              region,
+              resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.DeleteRangeResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_KV_DELETE_RANGE, factory, handler);
+      if(deleteHelper(backOffer, resp)){
+        break;
+      }
     }
-    ManagedChannel channel = session.getChannel(addressStr);
+  }
 
-    TikvBlockingStub blockingStub = TikvGrpc.newBlockingStub(channel);
+  private boolean deleteHelper(BackOffer bo, Kvrpcpb.DeleteRangeResponse resp) {
+    if (resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("DeleteRangeResponse failed without a cause");
+    }
+    if(resp.hasRegionError()){
+      bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      return false;
+    }
+    String error = resp.getError();
+    if(error != null && !error.isEmpty()){
+      throw new KeyException(resp.getError());
+    }
+    return true;
+  }
 
-    TikvStub asyncStub = TikvGrpc.newStub(channel);
-    client = new RegionStoreClient(region, session, blockingStub, asyncStub);
-    return client;
+  /**
+   * Prewrite batch keys
+   * @param bo
+   * @param primaryLock
+   * @param mutations
+   * @param startVersion
+   * @param ttl
+   * @param skipConstraintCheck
+   */
+  public void prewrite(BackOffer bo, ByteString primaryLock, Iterable<Kvrpcpb.Mutation> mutations, long startVersion, long ttl, boolean skipConstraintCheck){
+    while(true) {
+      Supplier<Kvrpcpb.PrewriteRequest> factory =
+              () -> Kvrpcpb.PrewriteRequest.newBuilder().
+                      setContext(region.getContext()).
+                      setStartVersion(startVersion).
+                      setPrimaryLock(primaryLock).
+                      addAllMutations(mutations).
+                      setLockTtl(ttl).
+                      setSkipConstraintCheck(skipConstraintCheck).
+                      build();
+      KVErrorHandler<Kvrpcpb.PrewriteResponse> handler = new KVErrorHandler<>(
+              regionManager,
+              this,
+              region,
+              resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.PrewriteResponse resp = callWithRetry(bo, TikvGrpc.METHOD_KV_PREWRITE, factory, handler);
+      if (prewriteHelper(bo, resp)) {
+        break;
+      }
+    }
+  }
+
+  private boolean prewriteHelper(BackOffer bo, Kvrpcpb.PrewriteResponse resp) {
+    if(resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("PrewriteResponse failed without a cause");
+    }
+    if (resp.hasRegionError()) {
+      //bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      //return false;
+      //Caller method should retry start prewrite
+      throw new RegionException(resp.getRegionError());
+    }
+    for(Kvrpcpb.KeyError err : resp.getErrorsList()){
+      if(err.hasLocked()){
+        Lock lock = new Lock(err.getLocked());
+        boolean ok = lockResolverClient.resolveLocks(bo, new ArrayList<>(Arrays.asList(lock)));
+        if(!ok){
+          bo.doBackOff(BoTxnLockFast, new KeyException((err.getLocked().toString())));
+        }
+        //retry prewrite directly in current method
+        return false;
+      }
+      else{
+        throw new KeyException(err.toString());
+      }
+    }
+    return true;
+  }
+
+  public void prewrite(BackOffer backOffer, ByteString primary, Iterable<Kvrpcpb.Mutation> mutations, long startTs, long lockTTL) {
+    this.prewrite(backOffer, primary, mutations, startTs, lockTTL, false);
+  }
+
+  /**
+   * Commit batch keys
+   * @param backOffer
+   * @param keys
+   * @param startVersion
+   * @param commitVersion
+   */
+  public void commit(BackOffer backOffer, Iterable<ByteString> keys, long startVersion, long commitVersion) {
+    while(true) {
+      Supplier<Kvrpcpb.CommitRequest> factory =
+              () -> Kvrpcpb.CommitRequest.newBuilder()
+                      .setStartVersion(startVersion)
+                      .setCommitVersion(commitVersion)
+                      .addAllKeys(keys)
+                      .setContext(region.getContext()).build();
+      KVErrorHandler<Kvrpcpb.CommitResponse> handler =
+              new KVErrorHandler<>(
+                      regionManager,
+                      this,
+                      region,
+                      resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.CommitResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_KV_COMMIT, factory, handler);
+      if(commitHelper(backOffer, resp)){
+        break;
+      }
+    }
+  }
+
+  private boolean commitHelper(BackOffer bo, Kvrpcpb.CommitResponse resp) {
+    if(resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("CommitResponse failed without a cause");
+    }
+    if(resp.hasRegionError()){
+      //bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      //return false;
+      //Caller method should restart commit
+      throw new RegionException(resp.getRegionError());
+    }
+    //if hasLock, need to resolveLocks and retry?
+    if(resp.hasError()) {
+      if (resp.getError().hasLocked()) {
+        Lock lock = new Lock(resp.getError().getLocked());
+        boolean ok = lockResolverClient.resolveLocks(bo, new ArrayList<>(Arrays.asList(lock)));
+        if (!ok) {
+          bo.doBackOff(BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
+        }
+        return false;
+      } else {
+        throw new KeyException(resp.getError());
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Clean up the uncommitted kv data with the specified key which version equals to startTs
+   * @param backOffer
+   * @param key
+   * @param startTs
+   * @return
+   */
+  public long cleanup(BackOffer backOffer, ByteString key, long startTs) {
+    while(true) {
+      Supplier<Kvrpcpb.CleanupRequest> factory =
+              () -> Kvrpcpb.CleanupRequest.newBuilder()
+                      .setContext(region.getContext())
+                      .setKey(key)
+                      .setStartVersion(startTs)
+                      .build();
+      KVErrorHandler<Kvrpcpb.CleanupResponse> handler = new KVErrorHandler<>(
+              regionManager,
+              this,
+              region,
+              resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.CleanupResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_KV_CLEANUP, factory, handler);
+      if(cleanUpHelper(backOffer, resp)) {
+        return resp.getCommitVersion();
+      }
+      // we should refresh region
+      region = regionManager.getRegionByKey(key);
+    }
+  }
+
+  private boolean cleanUpHelper(BackOffer bo, Kvrpcpb.CleanupResponse resp) {
+    if(resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("CleanupResponse failed without a cause");
+    }
+    if(resp.hasRegionError()){
+      bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      return false;
+    }
+    if(resp.hasError()) {
+      if (resp.getError().hasLocked()) {
+        Lock lock = new Lock(resp.getError().getLocked());
+        boolean ok = lockResolverClient.resolveLocks(bo, new ArrayList<>(Arrays.asList(lock)));
+        if (!ok) {
+          bo.doBackOff(BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
+        }
+        return false;
+      } else {
+        throw new KeyException(resp.getError());
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Batch roll back, clean up the lock information of the related key list with version equals to startVersion
+   * @param backOffer
+   * @param keys
+   * @param startVersion
+   */
+  public void batchRollback(BackOffer backOffer, Iterable<ByteString> keys, long startVersion){
+    while(true) {
+      Supplier<Kvrpcpb.BatchRollbackRequest> factory =
+              () -> Kvrpcpb.BatchRollbackRequest.newBuilder().setStartVersion(startVersion)
+                      .setContext(region.getContext()).addAllKeys(keys).build();
+      KVErrorHandler<Kvrpcpb.BatchRollbackResponse> handler =
+              new KVErrorHandler<>(
+                      regionManager,
+                      this,
+                      region,
+                      resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.BatchRollbackResponse resp = callWithRetry(backOffer, TikvGrpc.METHOD_KV_BATCH_ROLLBACK, factory, handler);
+      if(batchRollbackHelper(backOffer, resp)){
+        break;
+      }
+    }
+  }
+
+  private boolean batchRollbackHelper(BackOffer bo, Kvrpcpb.BatchRollbackResponse resp) {
+    if(resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("BatchRollbackResponse failed without a cause");
+    }
+    if(resp.hasRegionError()){
+      //bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      //return false;
+      //Caller method should restart rollback
+      throw new RegionException(resp.getRegionError());
+    }
+    if(resp.hasError()) {
+      if (resp.getError().hasLocked()) {
+        Lock lock = new Lock(resp.getError().getLocked());
+        boolean ok = lockResolverClient.resolveLocks(bo, new ArrayList<>(Arrays.asList(lock)));
+        if (!ok) {
+          bo.doBackOff(BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
+        }
+        return false;
+      } else {
+        throw new KeyException(resp.getError());
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Delete all expired history kv data which version less than specific safePoint
+   * @param bo
+   * @param safePoint
+   */
+  public void gc(BackOffer bo, long safePoint){
+    while(true) {
+      Supplier<Kvrpcpb.GCRequest> factory =
+              () -> Kvrpcpb.GCRequest.newBuilder().setSafePoint(safePoint).setContext(region.getContext()).build();
+      KVErrorHandler<Kvrpcpb.GCResponse> handler =
+              new KVErrorHandler<>(
+                      regionManager,
+                      this,
+                      region,
+                      resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.GCResponse resp = callWithRetry(bo, TikvGrpc.METHOD_KV_GC, factory, handler);
+      if (gcHelper(bo, resp)) {
+        break;
+      }
+    }
+  }
+
+  private boolean gcHelper(BackOffer bo, Kvrpcpb.GCResponse resp) {
+    if(resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("GCResponse failed without a cause");
+    }
+    if(resp.hasRegionError()){
+      bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      return false;
+    }
+    if(resp.hasError()) {
+      if (resp.getError().hasLocked()) {
+        Lock lock = new Lock(resp.getError().getLocked());
+        boolean ok = lockResolverClient.resolveLocks(bo, new ArrayList<>(Arrays.asList(lock)));
+        if (!ok) {
+          bo.doBackOff(BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
+        }
+        return false;
+      } else {
+        throw new KeyException(resp.getError());
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Scan all locks which version less than a specific version
+   * @param bo
+   * @param startKey
+   * @param maxVersion
+   * @param limit
+   * @return
+   */
+  public List<Kvrpcpb.LockInfo> scanLock(BackOffer bo, ByteString startKey , long maxVersion, int limit){
+    while(true) {
+      Supplier<Kvrpcpb.ScanLockRequest> factory =
+              () -> Kvrpcpb.ScanLockRequest.newBuilder().setContext(region.getContext())
+                      .setMaxVersion(maxVersion).setStartKey(startKey).setLimit(limit).build();
+      KVErrorHandler<Kvrpcpb.ScanLockResponse> handler =
+              new KVErrorHandler<>(
+                      regionManager,
+                      this,
+                      region,
+                      resp -> resp.hasRegionError() ? resp.getRegionError() : null);
+      Kvrpcpb.ScanLockResponse resp = callWithRetry(bo, TikvGrpc.METHOD_KV_SCAN_LOCK, factory, handler);
+      if (scanLockHelper(bo, resp)) {
+        return resp.getLocksList();
+      }
+
+      // we should refresh region
+      region = regionManager.getRegionByKey(startKey);
+    }
+  }
+
+  private boolean scanLockHelper(BackOffer bo, Kvrpcpb.ScanLockResponse resp) {
+    if(resp == null){
+      this.regionManager.onRequestFail(region);
+      throw new TiClientInternalException("ScanLockResponse failed without a cause");
+    }
+    if(resp.hasRegionError()){
+      bo.doBackOff(BoRegionMiss, new RegionException(resp.getRegionError()));
+      return false;
+    }
+    if(resp.hasError()) {
+      if (resp.getError().hasLocked()) {
+        Lock lock = new Lock(resp.getError().getLocked());
+        boolean ok = lockResolverClient.resolveLocks(bo, new ArrayList<>(Arrays.asList(lock)));
+        if (!ok) {
+          bo.doBackOff(BoTxnLockFast, new KeyException((resp.getError().getLocked().toString())));
+        }
+        return false;
+      } else {
+        throw new KeyException(resp.getError());
+      }
+    }
+    return true;
+  }
+
+  public static class RegionStoreClientBuilder {
+    private final TiConfiguration conf;
+    private final ChannelFactory channelFactory;
+    private final RegionManager regionManager;
+
+    public RegionStoreClientBuilder(
+            TiConfiguration conf, ChannelFactory channelFactory, RegionManager regionManager) {
+      Objects.requireNonNull(conf, "conf is null");
+      Objects.requireNonNull(channelFactory, "channelFactory is null");
+      Objects.requireNonNull(regionManager, "regionManager is null");
+      this.conf = conf;
+      this.channelFactory = channelFactory;
+      this.regionManager = regionManager;
+    }
+
+    public RegionStoreClient build(TiRegion region, Store store) {
+      Objects.requireNonNull(region, "region is null");
+      Objects.requireNonNull(store, "store is null");
+
+      String addressStr = store.getAddress();
+      if (logger.isDebugEnabled()) {
+        logger.debug(String.format("Create region store client on address %s", addressStr));
+      }
+      ManagedChannel channel = channelFactory.getChannel(addressStr);
+
+      TikvBlockingStub blockingStub = TikvGrpc.newBlockingStub(channel);
+      TikvStub asyncStub = TikvGrpc.newStub(channel);
+
+      return new RegionStoreClient(
+              conf, region, channelFactory, blockingStub, asyncStub, regionManager);
+    }
+
+    public RegionStoreClient build(ByteString key) {
+      Pair<TiRegion, Store> pair = regionManager.getRegionStorePairByKey(key);
+      return build(pair.first, pair.second);
+    }
+
+    public RegionStoreClient build(TiRegion region) {
+      Store store = regionManager.getStoreById(region.getLeader().getStoreId());
+      return build(region, store);
+    }
+
+    public RegionManager getRegionManager() {
+      return regionManager;
+    }
   }
 
   private RegionStoreClient(
-      TiRegion region, TiSession session, TikvBlockingStub blockingStub, TikvStub asyncStub) {
-    super(session);
+          TiConfiguration conf,
+          TiRegion region,
+          ChannelFactory channelFactory,
+          TikvBlockingStub blockingStub,
+          TikvStub asyncStub,
+          RegionManager regionManager) {
+    super(conf, channelFactory);
     checkNotNull(region, "Region is empty");
     checkNotNull(region.getLeader(), "Leader Peer is null");
     checkArgument(region.getLeader() != null, "Leader Peer is null");
-    this.regionManager = session.getRegionManager();
+    this.regionManager = regionManager;
     this.region = region;
     this.blockingStub = blockingStub;
     this.asyncStub = asyncStub;
-    this.lockResolverClient = new LockResolverClient(session, this.blockingStub, this.asyncStub);
+    this.lockResolverClient =
+            new LockResolverClient(
+                    conf, this.blockingStub, this.asyncStub, channelFactory, regionManager);
   }
 
   @Override
@@ -463,12 +876,12 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
     // When switch leader fails or the region changed its key range,
     // it would be necessary to re-split task's key range for new region.
     if (!region.getStartKey().equals(cachedRegion.getStartKey())
-        || !region.getEndKey().equals(cachedRegion.getEndKey())) {
+            || !region.getEndKey().equals(cachedRegion.getEndKey())) {
       return false;
     }
     region = cachedRegion;
     String addressStr = regionManager.getStoreById(region.getLeader().getStoreId()).getAddress();
-    ManagedChannel channel = getSession().getChannel(addressStr);
+    ManagedChannel channel = channelFactory.getChannel(addressStr);
     blockingStub = TikvGrpc.newBlockingStub(channel);
     asyncStub = TikvGrpc.newStub(channel);
     return true;
@@ -477,17 +890,17 @@ public class RegionStoreClient extends AbstractGRPCClient<TikvBlockingStub, Tikv
   @Override
   public void onStoreNotMatch(Store store) {
     String addressStr = store.getAddress();
-    ManagedChannel channel = getSession().getChannel(addressStr);
+    ManagedChannel channel = channelFactory.getChannel(addressStr);
     blockingStub = TikvGrpc.newBlockingStub(channel);
     asyncStub = TikvGrpc.newStub(channel);
     if (logger.isDebugEnabled() && region.getLeader().getStoreId() != store.getId()) {
       logger.debug(
-          "store_not_match may occur? "
-              + region
-              + ", original store = "
-              + store.getId()
-              + " address = "
-              + addressStr);
+              "store_not_match may occur? "
+                      + region
+                      + ", original store = "
+                      + store.getId()
+                      + " address = "
+                      + addressStr);
     }
   }
 }
